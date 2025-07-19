@@ -1,6 +1,5 @@
 import sys
-import pysqlite3
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+import sqlite3
 import streamlit as st
 from fact_checker_v4_wenxin import FactChecker
 import time
