@@ -1,21 +1,25 @@
-import streamlit as st
+import sys
+import sqlite3
 import os
 from typing import Dict, List, Any
+import chromadb
+from chromadb.utils import embedding_functions
+import streamlit as st
 import requests
+from duckduckgo_search import DDGS
 import numpy as np
 import re
-import time
-from duckduckgo_search import DDGS
 from FlagEmbedding import BGEM3FlagModel
 from openai import OpenAI
+import urllib.parse
+from bs4 import BeautifulSoup
+import time
 
-# 兼容云端无 chromadb
-try:
-    import chromadb
-    from chromadb.utils import embedding_functions
-    chromadb_available = True
-except ImportError:
-    chromadb_available = False
+# 强制修改sqlite3版本号（仅开发环境使用）
+if sqlite3.sqlite_version_info < (3, 35, 0):
+    sqlite3.sqlite_version = "3.38.0"
+    sqlite3.sqlite_version_info = (3, 38, 0)
+sys.modules["sqlite3"] = sqlite3
 
 # ========== FactChecker 类 ==========
 class FactChecker:
@@ -39,18 +43,15 @@ class FactChecker:
             st.error(f"加载BGE-M3模型错误: {str(e)}")
             self.embedding_model = None
 
-        # 初始化Chroma本地知识库（云端无chromadb时自动降级）
-        if chromadb_available:
-            try:
-                self.chroma_client = chromadb.Client()
-                self.collection = self.chroma_client.get_or_create_collection(
-                    name="my-knowledge-base",
-                    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-m3")
-                )
-            except Exception as e:
-                st.error(f"加载Chroma错误: {str(e)}")
-                self.collection = None
-        else:
+        # 初始化Chroma本地知识库
+        try:
+            self.chroma_client = chromadb.Client()
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="my-knowledge-base",
+                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-m3")
+            )
+        except Exception as e:
+            st.error(f"加载Chroma错误: {str(e)}")
             self.collection = None
 
     def extract_claim(self, text: str) -> str:
@@ -121,6 +122,32 @@ class FactChecker:
             st.error(f"提取关键信息错误: {str(e)}")
             return text
 
+    def search_baidu(self, query, num_results=5):
+        """百度搜索摘要抓取"""
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        url = f"https://www.baidu.com/s?wd={urllib.parse.quote(query)}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            for idx, result in enumerate(soup.select(".result")[:num_results]):
+                title = result.select_one("h3")
+                title = title.get_text(strip=True) if title else ""
+                snippet = result.select_one(".c-abstract") or result.select_one(".c-span-last")
+                snippet = snippet.get_text(strip=True) if snippet else ""
+                link = result.select_one("a")["href"] if result.select_one("a") else ""
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": snippet
+                })
+            return results
+        except Exception as e:
+            st.warning(f"百度搜索失败: {e}")
+            return []
+
     def search_local_knowledge(self, claim: str, top_k: int = 5) -> List[Dict[str, str]]:
         if not self.collection:
             return []
@@ -142,22 +169,29 @@ class FactChecker:
             return []
 
     def search_evidence(self, claim: str, num_results: int = 5) -> List[Dict[str, str]]:
+        evidence = []
+        # DuckDuckGo（外网）
         try:
             ddgs = DDGS(timeout=60)
             results = list(ddgs.text(claim, max_results=num_results))
-            external_evidence = []
             for result in results:
-                external_evidence.append({
+                evidence.append({
                     'title': result.get('title', ''),
                     'url': result.get('href', ''),
                     'snippet': result.get('body', '')
                 })
-            local_evidence = self.search_local_knowledge(claim, top_k=num_results)
-            combined_evidence = external_evidence + local_evidence
-            return combined_evidence
         except Exception as e:
-            st.error(f"外部证据检索错误: {str(e)}")
-            return []
+            st.warning(f"DuckDuckGo搜索失败: {e}")
+
+        # 百度（国内兜底）
+        baidu_results = self.search_baidu(claim, num_results=num_results)
+        evidence.extend(baidu_results)
+
+        # 本地知识库
+        local_evidence = self.search_local_knowledge(claim, top_k=num_results)
+        evidence.extend(local_evidence)
+
+        return evidence
 
     def get_evidence_chunks(self, evidence_docs: List[Dict[str, str]], claim: str, chunk_size: int = 200, chunk_overlap: int = 50, top_k: int = 10) -> List[Dict[str, Any]]:
         if not self.embedding_model:
@@ -261,7 +295,8 @@ class FactChecker:
                 "reasoning": f"评估过程中发生错误: {str(e)}"
             }
 
-# ========== Streamlit 前端 ==========
+# ================= Streamlit 前端 =================
+
 st.set_page_config(
     page_title="AI虚假新闻检测器",
     page_icon="🔍",
